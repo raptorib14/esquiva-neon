@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Esquiva Neón</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: #06070f;
+    color: #f0f8ff;
+    font-family: system-ui, Segoe UI, Arial, sans-serif;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: none;
+    overflow: hidden;
+  }
+  h1 { margin: 0 0 .4rem; font-size: 1.25rem; letter-spacing: .04em; color: #00f0ff; }
+  .hint { margin: 0 0 .75rem; color: #8ca0b8; font-size: .9rem; text-align: center; max-width: 40rem; padding: 0 .75rem; }
+  #wrap {
+    position: relative;
+    border: 2px solid #00f0ff;
+    border-radius: 10px;
+    box-shadow: 0 0 24px rgba(0,240,255,.25);
+    line-height: 0;
+    max-width: min(96vw, 640px);
+    max-height: min(70vh, 480px);
+  }
+  canvas {
+    display: block;
+    background: #080a18;
+    border-radius: 8px;
+    outline: none;
+    width: 100%;
+    height: auto;
+    max-height: min(70vh, 480px);
+    touch-action: none;
+  }
+  .foot { margin-top: .7rem; color: #8ca0b8; font-size: .82rem; text-align: center; padding: 0 .75rem; }
+  kbd {
+    display: inline-block; padding: .05rem .35rem; border: 1px solid #465a82;
+    border-radius: 4px; background: #12182a; font-size: .78rem;
+  }
+  @media (max-width: 700px) {
+    h1 { font-size: 1.05rem; }
+    .hint { font-size: .8rem; margin-bottom: .4rem; }
+    .foot { font-size: .75rem; }
+  }
+</style>
+</head>
+<body>
+  <h1>Esquiva Neón</h1>
+  <p class="hint">Hacé clic o tocá el juego. En PC: teclado. En celular: arrastrá para mover.</p>
+  <div id="wrap"><canvas id="game" width="640" height="480" tabindex="0" aria-label="Esquiva Neón"></canvas></div>
+  <p class="foot">
+    <kbd>←↑↓→</kbd> / <kbd>WASD</kbd> mover ·
+    <kbd>Enter</kbd>/<kbd>Espacio</kbd> empezar ·
+    <kbd>P</kbd> pausa ·
+    <kbd>R</kbd> menú / reiniciar
+    · arrastrá con el dedo en el celular
+  </p>
+<script>
+(function () {
+  "use strict";
+  const W = 640, H = 480;
+  const PLAYER = 36, EW = 40, EH = 28;
+  const SPEED = 280, SPAWN = 0.85, HURT = 0.9, LIVES0 = 3;
+  const CYAN = "#00f0ff", MAGENTA = "#ff28b4", BG = "#080a18";
+  const WHITE = "#f0f8ff", DIM = "#8ca0b8", RED = "#ff3c5a";
+
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+  const keys = Object.create(null);
+
+  // Touch / pointer drag state (game coords)
+  const touch = { active: false, id: null, gx: 0, gy: 0 };
+
+  // Expose for automated tests
+  const api = {
+    state: "menu",
+    lives: LIVES0,
+    score: 0,
+    spawned: 0,
+    collisions: 0,
+    frames: 0,
+    player: { x: W / 2 - PLAYER / 2, y: H - 80, w: PLAYER, h: PLAYER },
+    enemies: [],
+    hurtT: 0,
+    spawnT: 0,
+    paused: false,
+    resetPlay: null,
+    step: null,
+    start: null,
+    toMenu: null,
+  };
+  window.__ESQUIVA__ = api;
+
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+  function overlap(a, b) {
+    return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+  }
+
+  /** Map client coords → game (640x480) coords, accounting for CSS scaling. */
+  function clientToGame(clientX, clientY) {
+    const r = canvas.getBoundingClientRect();
+    return {
+      x: ((clientX - r.left) / r.width) * W,
+      y: ((clientY - r.top) / r.height) * H,
+    };
+  }
+
+  function resetPlay() {
+    api.player = { x: W / 2 - PLAYER / 2, y: H - 80, w: PLAYER, h: PLAYER };
+    api.enemies = [];
+    api.lives = LIVES0;
+    api.score = 0;
+    api.spawnT = 0;
+    api.hurtT = 0;
+    api.paused = false;
+  }
+  api.resetPlay = resetPlay;
+
+  function start() {
+    resetPlay();
+    api.state = "play";
+  }
+  api.start = start;
+
+  function toMenu() {
+    api.state = "menu";
+    api.paused = false;
+  }
+  api.toMenu = toMenu;
+
+  function drawRoundRect(x, y, w, h, r, fill, stroke) {
+    ctx.beginPath();
+    const rr = Math.min(r, w / 2, h / 2);
+    ctx.moveTo(x + rr, y);
+    ctx.arcTo(x + w, y, x + w, y + h, rr);
+    ctx.arcTo(x + w, y + h, x, y + h, rr);
+    ctx.arcTo(x, y + h, x, y, rr);
+    ctx.arcTo(x, y, x + w, y, rr);
+    ctx.closePath();
+    if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+    if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = 2; ctx.stroke(); }
+  }
+
+  function text(str, size, color, x, y) {
+    ctx.fillStyle = color;
+    ctx.font = "700 " + size + "px system-ui, Segoe UI, Arial, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(str, x, y);
+  }
+
+  function draw() {
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, W, H);
+
+    if (api.state === "menu") {
+      text("ESQUIVA NEÓN", 48, CYAN, W / 2, H / 2 - 80);
+      text("Movete con flechas o WASD", 22, WHITE, W / 2, H / 2 - 20);
+      text("En celular: arrastrá para mover", 20, WHITE, W / 2, H / 2 + 8);
+      text("Esquivá los bloques magenta", 22, MAGENTA, W / 2, H / 2 + 42);
+      text("ENTER / ESPACIO / TOCAR para jugar", 18, DIM, W / 2, H / 2 + 88);
+      text("Creado por Nico Gonnet", 16, DIM, W / 2, H / 2 + 130);
+      return;
+    }
+
+    if (api.state === "gameover") {
+      text("GAME OVER", 48, RED, W / 2, H / 2 - 50);
+      text("Puntaje: " + api.score, 28, WHITE, W / 2, H / 2 + 10);
+      text("R = menú   ·   Enter / tocar = otra vez", 18, DIM, W / 2, H / 2 + 60);
+      return;
+    }
+
+    // play (+ pause overlay)
+    const blink = api.hurtT > 0 && Math.floor(api.hurtT * 10) % 2 === 0;
+    drawRoundRect(api.player.x, api.player.y, api.player.w, api.player.h, 6,
+      blink ? WHITE : CYAN, WHITE);
+    for (const e of api.enemies) {
+      drawRoundRect(e.x, e.y, e.w, e.h, 4, MAGENTA, WHITE);
+    }
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.fillStyle = WHITE;
+    ctx.font = "600 18px system-ui, Segoe UI, Arial, sans-serif";
+    ctx.fillText("Vidas: " + api.lives + "   Puntaje: " + api.score, 12, 10);
+    ctx.fillStyle = DIM;
+    ctx.font = "500 14px system-ui, Segoe UI, Arial, sans-serif";
+    ctx.fillText("P = pausa", 12, 34);
+
+    if (api.paused) {
+      ctx.fillStyle = "rgba(0,0,0,0.55)";
+      ctx.fillRect(0, 0, W, H);
+      text("PAUSA", 42, CYAN, W / 2, H / 2 - 10);
+      text("P para seguir", 20, WHITE, W / 2, H / 2 + 35);
+    }
+  }
+
+  function step(dt) {
+    api.frames++;
+    if (api.state !== "play" || api.paused) {
+      draw();
+      return;
+    }
+
+    let dx = 0, dy = 0;
+    if (keys.ArrowLeft || keys.a || keys.A) dx -= 1;
+    if (keys.ArrowRight || keys.d || keys.D) dx += 1;
+    if (keys.ArrowUp || keys.w || keys.W) dy -= 1;
+    if (keys.ArrowDown || keys.s || keys.S) dy += 1;
+    if (dx || dy) {
+      const len = Math.hypot(dx, dy);
+      dx /= len; dy /= len;
+      api.player.x = clamp(api.player.x + dx * SPEED * dt, 0, W - PLAYER);
+      api.player.y = clamp(api.player.y + dy * SPEED * dt, 0, H - PLAYER);
+    }
+
+    // Touch drag: pull player toward finger (smooth, speed-capped)
+    if (touch.active) {
+      const cx = api.player.x + PLAYER / 2;
+      const cy = api.player.y + PLAYER / 2;
+      const tx = touch.gx - cx;
+      const ty = touch.gy - cy;
+      const dist = Math.hypot(tx, ty);
+      if (dist > 2) {
+        const maxStep = SPEED * 1.35 * dt;
+        const stepN = Math.min(dist, maxStep);
+        api.player.x = clamp(api.player.x + (tx / dist) * stepN, 0, W - PLAYER);
+        api.player.y = clamp(api.player.y + (ty / dist) * stepN, 0, H - PLAYER);
+      }
+    }
+
+    api.hurtT = Math.max(0, api.hurtT - dt);
+    api.spawnT += dt;
+    while (api.spawnT >= SPAWN) {
+      api.spawnT -= SPAWN;
+      api.enemies.push({
+        x: Math.floor(Math.random() * (W - EW)),
+        y: -EH,
+        w: EW, h: EH,
+        speed: 140 + Math.random() * 120
+      });
+      api.spawned++;
+    }
+
+    const next = [];
+    for (const e of api.enemies) {
+      e.y += e.speed * dt;
+      if (e.y > H) { api.score++; continue; }
+      if (api.hurtT <= 0 && overlap(api.player, e)) {
+        api.lives--;
+        api.hurtT = HURT;
+        api.collisions++;
+        if (api.lives <= 0) api.state = "gameover";
+        continue;
+      }
+      next.push(e);
+    }
+    api.enemies = next;
+    draw();
+  }
+  api.step = step;
+
+  window.addEventListener("keydown", function (ev) {
+    keys[ev.key] = true;
+    if (["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"," ","Spacebar"].indexOf(ev.key) >= 0) {
+      ev.preventDefault();
+    }
+    if (ev.repeat) return;
+
+    if (api.state === "menu" && (ev.key === "Enter" || ev.key === " ")) {
+      start();
+      return;
+    }
+    if (api.state === "gameover") {
+      if (ev.key === "r" || ev.key === "R") { toMenu(); return; }
+      if (ev.key === "Enter" || ev.key === " ") { start(); return; }
+    }
+    if (api.state === "play" && (ev.key === "p" || ev.key === "P")) {
+      api.paused = !api.paused;
+      draw();
+      return;
+    }
+    if (api.state === "play" && (ev.key === "r" || ev.key === "R") && !api.paused) {
+      start();
+    }
+  });
+  window.addEventListener("keyup", function (ev) { keys[ev.key] = false; });
+
+  // Pointer / touch: tap to start or restart; drag to move in play
+  canvas.addEventListener("pointerdown", function (ev) {
+    canvas.focus();
+    canvas.setPointerCapture(ev.pointerId);
+    const g = clientToGame(ev.clientX, ev.clientY);
+    if (api.state === "menu" || api.state === "gameover") {
+      start();
+      // also begin drag so first move works immediately
+      touch.active = true;
+      touch.id = ev.pointerId;
+      touch.gx = g.x;
+      touch.gy = g.y;
+      return;
+    }
+    if (api.state === "play") {
+      touch.active = true;
+      touch.id = ev.pointerId;
+      touch.gx = g.x;
+      touch.gy = g.y;
+    }
+  });
+  canvas.addEventListener("pointermove", function (ev) {
+    if (!touch.active || touch.id !== ev.pointerId) return;
+    const g = clientToGame(ev.clientX, ev.clientY);
+    touch.gx = g.x;
+    touch.gy = g.y;
+  });
+  function endTouch(ev) {
+    if (touch.id === ev.pointerId) {
+      touch.active = false;
+      touch.id = null;
+    }
+  }
+  canvas.addEventListener("pointerup", endTouch);
+  canvas.addEventListener("pointercancel", endTouch);
+
+  canvas.focus();
+
+  let last = performance.now();
+  function loop(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    step(dt);
+    requestAnimationFrame(loop);
+  }
+  draw();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
